@@ -13974,3 +13974,73 @@ async def test_connect_requires_the_requested_vendor_grant(monkeypatch, granted,
     monkeypatch.setattr(db, "get_user_oauth_credential", read)
     assert await endpoints._vendor_credential_state("owner", "server", required) == expected
     read.assert_awaited_once_with(prisma, "owner", "server")
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_routes_the_jwt_bearer_grant_to_the_aggregate_gateway():
+    """A requesting app presents its identity provider's client_id, never a gateway DCR one, so
+    the aggregate dispatch keys on the grant type for RFC 7523 and hands the assertion to the
+    ID-JAG redeemer. A per-server token endpoint never serves that grant."""
+    from litellm.proxy._experimental.mcp_server import discoverable_endpoints
+    from litellm.proxy._experimental.mcp_server.gateway_dcr_flow import JWT_BEARER_GRANT_TYPE
+    from litellm.proxy._experimental.mcp_server.id_jag_grant import redeem_id_jag_assertion
+
+    request = _mock_callback_request("https://litellm.example.com/")
+    aggregate = AsyncMock(return_value=MagicMock(status_code=200))
+    with patch.object(discoverable_endpoints, "aggregate_token", new=aggregate):
+        response = await discoverable_endpoints.token_endpoint(
+            request=request,
+            grant_type=JWT_BEARER_GRANT_TYPE,
+            client_id="0oa-requesting-app",
+            client_secret="app-secret",
+            assertion="eyJ.assertion.sig",
+        )
+    assert response.status_code == 200
+    kwargs = aggregate.await_args.kwargs
+    assert (kwargs["grant_type"], kwargs["client_id"], kwargs["client_secret"], kwargs["assertion"]) == (
+        JWT_BEARER_GRANT_TYPE,
+        "0oa-requesting-app",
+        "app-secret",
+        "eyJ.assertion.sig",
+    )
+    assert kwargs["redeem_assertion"] is redeem_id_jag_assertion
+    with patch.object(discoverable_endpoints, "aggregate_token", new=aggregate):
+        with pytest.raises(HTTPException):
+            await discoverable_endpoints.token_endpoint(
+                request=request,
+                grant_type=JWT_BEARER_GRANT_TYPE,
+                client_id="0oa-requesting-app",
+                assertion="eyJ.assertion.sig",
+                mcp_server_name="no-such-server",
+            )
+    assert aggregate.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_takes_the_client_id_from_http_basic_when_the_form_leaves_it_out():
+    """RFC 6749 section 2.3.1: a confidential app may authenticate with HTTP Basic alone, so the
+    aggregate dispatch reads client_id from that header. With neither the form field nor the
+    header the request is a 400 invalid_request, not a 422."""
+    from base64 import b64encode
+
+    from litellm.proxy._experimental.mcp_server import discoverable_endpoints
+    from litellm.proxy._experimental.mcp_server.gateway_dcr_flow import JWT_BEARER_GRANT_TYPE
+
+    request = _mock_callback_request("https://litellm.example.com/")
+    request.headers = {"authorization": "Basic " + b64encode(b"0oa-requesting-app:app-secret").decode()}
+    aggregate = AsyncMock(return_value=MagicMock(status_code=200))
+    with patch.object(discoverable_endpoints, "aggregate_token", new=aggregate):
+        response = await discoverable_endpoints.token_endpoint(
+            request=request, grant_type=JWT_BEARER_GRANT_TYPE, client_id=None, assertion="eyJ.assertion.sig"
+        )
+    assert response.status_code == 200
+    assert aggregate.await_args.kwargs["client_id"] == "0oa-requesting-app"
+    request.headers = {}
+    with patch.object(discoverable_endpoints, "aggregate_token", new=aggregate):
+        with pytest.raises(HTTPException) as refused:
+            await discoverable_endpoints.token_endpoint(
+                request=request, grant_type=JWT_BEARER_GRANT_TYPE, client_id=None, assertion="eyJ.assertion.sig"
+            )
+    assert refused.value.status_code == 400
+    assert refused.value.detail["error"] == "invalid_request"
+    assert aggregate.await_count == 1

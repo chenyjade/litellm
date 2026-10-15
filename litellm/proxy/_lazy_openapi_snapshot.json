@@ -36194,9 +36194,27 @@
         },
         "Body_token_endpoint__mcp_server_name__token_post": {
           "properties": {
+            "assertion": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assertion"
+            },
             "client_id": {
-              "title": "Client Id",
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Client Id"
             },
             "client_secret": {
               "anyOf": [
@@ -36293,17 +36311,34 @@
             }
           },
           "required": [
-            "grant_type",
-            "client_id"
+            "grant_type"
           ],
           "title": "Body_token_endpoint__mcp_server_name__token_post",
           "type": "object"
         },
         "Body_token_endpoint_token_post": {
           "properties": {
+            "assertion": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assertion"
+            },
             "client_id": {
-              "title": "Client Id",
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Client Id"
             },
             "client_secret": {
               "anyOf": [
@@ -36400,8 +36435,7 @@
             }
           },
           "required": [
-            "grant_type",
-            "client_id"
+            "grant_type"
           ],
           "title": "Body_token_endpoint_token_post",
           "type": "object"

@@ -27478,8 +27478,10 @@ export interface components {
         };
         /** Body_token_endpoint__mcp_server_name__token_post */
         Body_token_endpoint__mcp_server_name__token_post: {
+            /** Assertion */
+            assertion?: string | null;
             /** Client Id */
-            client_id: string;
+            client_id?: string | null;
             /** Client Secret */
             client_secret?: string | null;
             /** Code */
@@ -27505,8 +27507,10 @@ export interface components {
         };
         /** Body_token_endpoint_token_post */
         Body_token_endpoint_token_post: {
+            /** Assertion */
+            assertion?: string | null;
             /** Client Id */
-            client_id: string;
+            client_id?: string | null;
             /** Client Secret */
             client_secret?: string | null;
             /** Code */

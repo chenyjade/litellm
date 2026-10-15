@@ -199,15 +199,21 @@ class MintProxyCredential(Protocol):
 
 
 TOKEN_EXCHANGE_GRANT_TYPE: Final = "urn:ietf:params:oauth:grant-type:token-exchange"
+JWT_BEARER_GRANT_TYPE: Final = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
 
-def supported_grant_types(token_exchange_available: bool) -> tuple[str, ...]:
+def supported_grant_types(token_exchange_available: bool, jwt_bearer_available: bool = False) -> tuple[str, ...]:
     """The grants ``/token`` can serve on this deployment. The RFC 8693 exchange is listed
     only where the JWT auth that proves a subject token is on, backed by a database, and
-    licensed, so a client never selects a grant the gateway would then refuse."""
-    if token_exchange_available:
-        return ("authorization_code", "refresh_token", TOKEN_EXCHANGE_GRANT_TYPE)
-    return ("authorization_code", "refresh_token")
+    licensed, so a client never selects a grant the gateway would then refuse. The RFC 7523
+    jwt-bearer grant (an ID-JAG from the identity provider) is listed only where, on top of
+    that, the operator has allowlisted at least one requesting app."""
+    return (
+        "authorization_code",
+        "refresh_token",
+        *((TOKEN_EXCHANGE_GRANT_TYPE,) if token_exchange_available else ()),
+        *((JWT_BEARER_GRANT_TYPE,) if jwt_bearer_available else ()),
+    )
 
 
 """RFC 8693: a native client that already holds a token from the customer's identity
@@ -232,8 +238,20 @@ class SubjectIdentity(LiteLLMBaseModel):
 
 class SubjectTokenRefusal(LiteLLMBaseModel):
     model_config = ConfigDict(frozen=True)
-    error: Literal["unsupported_grant_type", "invalid_request", "temporarily_unavailable"]
+    error: Literal[
+        "unsupported_grant_type", "invalid_request", "invalid_grant", "invalid_client", "temporarily_unavailable"
+    ]
     description: str = Field(min_length=1)
+
+
+class AssertionIdentity(SubjectIdentity):
+    """The litellm user an RFC 7523 assertion (an ID-JAG) stands for, plus what the grant
+    tail needs from the assertion itself: the single-use key for its ``jti``, how long that
+    marker must outlive it, and the ``scope`` the credential is issued for."""
+
+    replay_key: str = Field(min_length=1)
+    replay_ttl_seconds: int = Field(gt=0)
+    scope: str | None = None
 
 
 class ExchangeSubjectToken(Protocol):
@@ -275,6 +293,25 @@ async def _refuse_proxy_credential(user_id: str, team_id: str | None) -> ProxyCr
 async def _refuse_subject_token(subject_token: str, request: Request) -> SubjectTokenRefusal:
     return SubjectTokenRefusal(
         error="unsupported_grant_type", description="this gateway is not configured to exchange IdP tokens"
+    )
+
+
+class RedeemAssertion(Protocol):
+    """Injected RFC 7523 assertion verifier ``(assertion, client_id, client_secret, request)``:
+    proves an ID-JAG the identity provider minted for the requesting app ``client_id``,
+    authenticates that app, and names the litellm user the assertion stands for, or says why
+    this gateway will not take it."""
+
+    def __call__(
+        self, assertion: str, client_id: str, client_secret: str | None, request: Request, /
+    ) -> Awaitable[AssertionIdentity | SubjectTokenRefusal]: ...
+
+
+async def _refuse_assertion(
+    assertion: str, client_id: str, client_secret: str | None, request: Request
+) -> SubjectTokenRefusal:
+    return SubjectTokenRefusal(
+        error="unsupported_grant_type", description="this gateway is not configured to redeem identity assertions"
     )
 
 
@@ -696,7 +733,9 @@ class NativeClientAuthContract(TypedDict):
     revocation_endpoint_auth_methods_supported: ReadOnly[tuple[str, ...]]
 
 
-def native_client_auth_contract(request: Request, token_exchange_available: bool) -> NativeClientAuthContract:
+def native_client_auth_contract(
+    request: Request, token_exchange_available: bool, jwt_bearer_available: bool = False
+) -> NativeClientAuthContract:
     """The versioned discovery document at ``/.well-known/litellm-cli-auth``: everything a
     native client (in any language) needs to run the sign-in without reading LiteLLM
     source. ``resource`` is the exact value to send as the RFC 8707 ``resource`` parameter
@@ -711,7 +750,7 @@ def native_client_auth_contract(request: Request, token_exchange_available: bool
         "revocation_endpoint": f"{base_url}/revoke",
         "resource": base_url,
         "response_types_supported": ("code",),
-        "grant_types_supported": supported_grant_types(token_exchange_available),
+        "grant_types_supported": supported_grant_types(token_exchange_available, jwt_bearer_available),
         "code_challenge_methods_supported": ("S256",),
         "token_endpoint_auth_methods_supported": ("none",),
         "revocation_endpoint_auth_methods_supported": ("none",),
@@ -1233,10 +1272,11 @@ class _ProxyCredentialTokenResponse(TypedDict):
     access_token: ReadOnly[str]
     token_type: ReadOnly[Literal["Bearer"]]
     expires_in: ReadOnly[int]
-    refresh_token: ReadOnly[str]
+    refresh_token: NotRequired[ReadOnly[str]]
     user_id: ReadOnly[str]
     team_id: ReadOnly[str | None]
     issued_token_type: NotRequired[ReadOnly[_IssuedTokenType]]
+    scope: NotRequired[ReadOnly[str]]
 
 
 def proxy_credential_response(
@@ -1245,6 +1285,7 @@ def proxy_credential_response(
     signing: SessionSigning,
     issued_token_type: _IssuedTokenType | None = None,
     family: str | None = None,
+    scope: str | None = None,
 ) -> Response:
     """The proxy-API token response: the access token is the very credential ``lite
     login`` stores (accepted on every proxy route with user and team attribution), and
@@ -1256,7 +1297,7 @@ def proxy_credential_response(
     refresh: Final = mint_session_refresh_token(bound_principal, signing.keys, signing.now, family=family)
     if not isinstance(refresh, MintedSessionToken):
         return _oauth_error(500, "server_error", "failed to mint the session credential")
-    credential: Final[_ProxyCredentialTokenResponse] = {
+    renewable: Final[_ProxyCredentialTokenResponse] = {
         "access_token": minted.key,
         "token_type": "Bearer",
         "expires_in": minted.expires_in,
@@ -1264,10 +1305,25 @@ def proxy_credential_response(
         "user_id": minted.user_id,
         "team_id": minted.team_id,
     }
+    credential: Final[_ProxyCredentialTokenResponse] = renewable if scope is None else {**renewable, "scope": scope}
     if issued_token_type is None:
         return JSONResponse(status_code=200, content=credential, headers=TOKEN_NO_CACHE_HEADERS)
     exchanged: Final[_ProxyCredentialTokenResponse] = {**credential, "issued_token_type": issued_token_type}
     return JSONResponse(status_code=200, content=exchanged, headers=TOKEN_NO_CACHE_HEADERS)
+
+
+def assertion_credential_response(minted: MintedProxyCredential, scope: str | None) -> Response:
+    """The proxy-API token response for an assertion grant: the same access token, with the
+    scope the assertion carried, and no refresh token."""
+    unscoped: Final[_ProxyCredentialTokenResponse] = {
+        "access_token": minted.key,
+        "token_type": "Bearer",
+        "expires_in": minted.expires_in,
+        "user_id": minted.user_id,
+        "team_id": minted.team_id,
+    }
+    credential: Final[_ProxyCredentialTokenResponse] = unscoped if scope is None else {**unscoped, "scope": scope}
+    return JSONResponse(status_code=200, content=credential, headers=TOKEN_NO_CACHE_HEADERS)
 
 
 def _reload_failure_response(failure: ReloadUserFailure) -> Response:
@@ -1290,7 +1346,9 @@ def _subject_token_refusal_response(refusal: SubjectTokenRefusal) -> Response:
     match refusal.error:
         case "temporarily_unavailable":
             return _oauth_error(503, refusal.error, refusal.description)
-        case "unsupported_grant_type" | "invalid_request":
+        case "invalid_client":
+            return _oauth_error(401, refusal.error, refusal.description)
+        case "unsupported_grant_type" | "invalid_request" | "invalid_grant":
             return _oauth_error(400, refusal.error, refusal.description)
         case _:
             assert_never(refusal.error)
@@ -1343,6 +1401,9 @@ async def aggregate_token(
     subject_token_type: str | None = None,
     requested_token_type: str | None = None,
     exchange_subject_token: ExchangeSubjectToken = _refuse_subject_token,
+    assertion: str | None = None,
+    client_secret: str | None = None,
+    redeem_assertion: RedeemAssertion = _refuse_assertion,
 ) -> Response:
     """The aggregate token verb: authorization_code and refresh_token grants for the
     identity-only session pair, or for the proxy-API credential when the grant was issued
@@ -1389,10 +1450,19 @@ async def aggregate_token(
             exchange_subject_token=exchange_subject_token,
             issue=issue,
         )
+    if grant_type == JWT_BEARER_GRANT_TYPE:
+        return await _jwt_bearer_grant(
+            request=request,
+            assertion=assertion,
+            client_id=client_id,
+            client_secret=client_secret,
+            redeem_assertion=redeem_assertion,
+            issue=issue,
+        )
     return _oauth_error(
         400,
         "unsupported_grant_type",
-        f"grant_type must be authorization_code, refresh_token, or {TOKEN_EXCHANGE_GRANT_TYPE}",
+        f"grant_type must be authorization_code, refresh_token, {TOKEN_EXCHANGE_GRANT_TYPE}, or {JWT_BEARER_GRANT_TYPE}",
     )
 
 
@@ -1518,6 +1588,33 @@ class _GrantIssuer:
             return _mint_failure_response(minted)
         return proxy_credential_response(minted, principal, self._signing, issued_token_type=ACCESS_TOKEN_TOKEN_TYPE)
 
+    async def redeem_assertion(
+        self, assertion: str, client_id: str, client_secret: str | None, redeem_assertion: RedeemAssertion
+    ) -> Response:
+        """The RFC 7523 tail: prove the assertion and the requesting app, claim the assertion's
+        ``jti`` before anything is minted (RFC 7523 section 3 makes a replayed ``jti`` a
+        rejection, and the identity provider mints a fresh assertion cheaply, so a mint that
+        fails after the claim costs the client one more round trip, never a replay window),
+        then mint the proxy credential the user is revalidated for. No refresh token comes
+        with it (RFC 7521 section 4.1): the app renews by asking its identity provider for a
+        fresh assertion, which keeps the user's standing there in the loop."""
+        target_refusal: Final = self._proxy_api_target_refusal()
+        if target_refusal is not None:
+            return target_refusal
+        identity: Final = await redeem_assertion(assertion, client_id, client_secret, self._request)
+        if isinstance(identity, SubjectTokenRefusal):
+            return _subject_token_refusal_response(identity)
+        refused: Final = _claim_refusal(
+            await self._guard.claim(identity.replay_key, identity.replay_ttl_seconds),
+            _oauth_error(400, "invalid_grant", "the assertion has already been redeemed"),
+        )
+        if refused is not None:
+            return refused
+        minted: Final = await self._mint_proxy_credential(identity.user_id, identity.team_id)
+        if not isinstance(minted, MintedProxyCredential):
+            return _mint_failure_response(minted)
+        return assertion_credential_response(minted, identity.scope)
+
     def _proxy_api_target_refusal(self) -> Response | None:
         if self._resource is None or is_proxy_api_resource(self._request, self._resource):
             return None
@@ -1633,6 +1730,19 @@ async def refresh_proxy_credential(
         replayed=_REFRESH_REPLAYED_DESCRIPTION,
         family=opened.family,
     )
+
+
+async def _jwt_bearer_grant(
+    request: Request,
+    assertion: str | None,
+    client_id: str,
+    client_secret: str | None,
+    redeem_assertion: RedeemAssertion,
+    issue: _GrantIssuer,
+) -> Response:
+    if not assertion:
+        return _oauth_error(400, "invalid_request", "assertion is required")
+    return await issue.redeem_assertion(assertion, client_id, client_secret, redeem_assertion)
 
 
 async def _token_exchange_grant(

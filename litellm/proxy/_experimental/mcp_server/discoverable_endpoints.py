@@ -56,6 +56,7 @@ from litellm.proxy._experimental.mcp_server.faults import (
     render_token_fault,
 )
 from litellm.proxy._experimental.mcp_server.gateway_dcr_flow import (
+    JWT_BEARER_GRANT_TYPE,
     VendorCredentialState,
     aggregate_authorize,
     aggregate_token,
@@ -70,6 +71,11 @@ from litellm.proxy._experimental.mcp_server.gateway_dcr_flow import (
     relative_request_url,
     revoke_refresh_token,
     supported_grant_types,
+)
+from litellm.proxy._experimental.mcp_server.id_jag_grant import (
+    basic_client_id,
+    jwt_bearer_available,
+    redeem_id_jag_assertion,
 )
 from litellm.proxy._experimental.mcp_server.idp_token_exchange import (
     exchange_idp_subject_token,
@@ -2337,7 +2343,7 @@ async def token_endpoint(
     grant_type: str = Form(...),
     code: str = Form(None),
     redirect_uri: str = Form(None),
-    client_id: str = Form(...),
+    client_id: str | None = Form(None),
     client_secret: str | None = Form(None),
     code_verifier: str = Form(None),
     refresh_token: str | None = Form(None),
@@ -2346,6 +2352,7 @@ async def token_endpoint(
     subject_token: str | None = Form(None),
     subject_token_type: str | None = Form(None),
     requested_token_type: str | None = Form(None),
+    assertion: str | None = Form(None),
     mcp_server_name: str | None = None,
 ):
     """
@@ -2357,7 +2364,14 @@ async def token_endpoint(
     3. Return the token
     4. Return a virtual key in this response
     """
-    if mcp_server_name is None and is_gateway_dcr_client_id(client_id):
+    presented_client_id: Final = client_id or basic_client_id(request.headers.get("authorization"))
+    if presented_client_id is None:
+        raise HTTPException(
+            status_code=400, detail={"error": "invalid_request", "error_description": "client_id is required"}
+        )
+    if mcp_server_name is None and (
+        is_gateway_dcr_client_id(presented_client_id) or grant_type == JWT_BEARER_GRANT_TYPE
+    ):
         from litellm.proxy.proxy_server import (  # noqa: PLC0415  # circular import at module load
             master_key,
             user_api_key_cache,
@@ -2368,7 +2382,7 @@ async def token_endpoint(
             grant_type=grant_type,
             code=code,
             redirect_uri=redirect_uri,
-            client_id=client_id,
+            client_id=presented_client_id,
             code_verifier=code_verifier,
             refresh_token=refresh_token,
             master_key=master_key,
@@ -2380,9 +2394,12 @@ async def token_endpoint(
             subject_token_type=subject_token_type,
             requested_token_type=requested_token_type,
             exchange_subject_token=exchange_idp_subject_token,
+            assertion=assertion,
+            client_secret=client_secret,
+            redeem_assertion=redeem_id_jag_assertion,
         )
 
-    lookup_name: Final = mcp_server_name or client_id
+    lookup_name: Final = mcp_server_name or presented_client_id
     client_ip: Final = IPAddressUtils.get_mcp_client_ip(request)
     mcp_server = _resolve_mcp_server_by_name_or_id(lookup_name, client_ip)
     if mcp_server is None and mcp_server_name is None:
@@ -2395,7 +2412,7 @@ async def token_endpoint(
         grant_type=grant_type,
         code=code,
         redirect_uri=redirect_uri,
-        client_id=client_id,
+        client_id=presented_client_id,
         client_secret=client_secret,
         code_verifier=code_verifier,
         refresh_token=refresh_token,
@@ -2509,7 +2526,8 @@ async def native_client_auth_discovery(request: Request) -> JSONResponse:
     """The versioned contract a native client (``lite login --pkce``, or a CLI in any other
     language) reads to sign a user in through the browser and obtain a proxy credential."""
     return JSONResponse(
-        native_client_auth_contract(request, token_exchange_available()), headers=TOKEN_NO_CACHE_HEADERS
+        native_client_auth_contract(request, token_exchange_available(), jwt_bearer_available()),
+        headers=TOKEN_NO_CACHE_HEADERS,
     )
 
 
@@ -3058,7 +3076,7 @@ def _build_aggregate_protected_resource_response(request: Request) -> dict:
 
 
 def _build_aggregate_authorization_server_response(
-    request: Request, token_exchange_available: bool
+    request: Request, token_exchange_available: bool, jwt_bearer_available: bool = False
 ) -> dict[str, object]:
     """RFC 8414 metadata for the gateway as the aggregate authorization server.
 
@@ -3078,9 +3096,9 @@ def _build_aggregate_authorization_server_response(
         "registration_endpoint": f"{request_base_url}/register",
         "response_types_supported": ["code"],
         "scopes_supported": [],
-        "grant_types_supported": supported_grant_types(token_exchange_available),
+        "grant_types_supported": supported_grant_types(token_exchange_available, jwt_bearer_available),
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
     }
 
 
@@ -3116,7 +3134,7 @@ async def oauth_authorization_server_aggregate(request: Request):
     per-server row win here instead would serve an issuer of {base} against a resource that
     advertised {base}/mcp, which fails the RFC 8414 issuer check and breaks the front door.
     """
-    return _build_aggregate_authorization_server_response(request, token_exchange_available())
+    return _build_aggregate_authorization_server_response(request, token_exchange_available(), jwt_bearer_available())
 
 
 # Standard MCP pattern: /.well-known/oauth-protected-resource/mcp/{server_name}
