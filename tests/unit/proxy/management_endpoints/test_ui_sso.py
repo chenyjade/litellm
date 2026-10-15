@@ -8993,7 +8993,8 @@ async def test_debug_page_survives_a_store_outage(monkeypatch, caplog):
     not the page."""
     from litellm.proxy.management_endpoints.ui_sso import warn_if_id_jag_capture_gap
 
-    monkeypatch.setenv("SAML_IDP_METADATA_URL", "https://idp.example.com/metadata")
+    for var in ("MICROSOFT_CLIENT_ID", "GOOGLE_CLIENT_ID", "GENERIC_CLIENT_ID", "SAML_IDP_METADATA_URL"):
+        monkeypatch.delenv(var, raising=False)
     retention_check = AsyncMock(side_effect=Exception("db down"))
     with caplog.at_level(logging.WARNING, logger="LiteLLM Proxy"):
         assert await warn_if_id_jag_capture_gap(retention_enabled=retention_check) is None
@@ -9119,7 +9120,7 @@ async def test_saml_callback_enforces_free_sso_user_limit_after_validation():
 
     async def _fake_handle_acs(**kwargs):
         call_order.append("validate")
-        return CustomOpenID(
+        return (CustomOpenID(
             id="dana@litellm.ai",
             email="dana@litellm.ai",
             first_name=None,
@@ -9129,7 +9130,7 @@ async def test_saml_callback_enforces_free_sso_user_limit_after_validation():
             provider="saml",
             team_ids=[],
             user_role=None,
-        )
+        ), None)
 
     async def _fake_count_billable_users():
         call_order.append("count")
@@ -9731,7 +9732,6 @@ def _id_jag_gap_warnings(caplog) -> list[str]:
 @pytest.mark.parametrize(
     "provider_env, expected_fragment",
     [
-        ({"SAML_IDP_METADATA_URL": "https://idp.example.com/metadata"}, "saml"),
         ({}, "no SSO provider is configured"),
     ],
 )

@@ -37,6 +37,7 @@ from litellm.proxy._experimental.mcp_server.outbound_credentials.sso_assertion_r
 from litellm.proxy._experimental.mcp_server.outbound_credentials.sso_assertion_store import (
     AssertionStoreUnavailable,
     SSOIdentityAssertion,
+    assertion_from_saml_login,
 )
 
 SIGNING_KEY = "test-idp-signing-key-32-bytes-long-xxxx"
@@ -316,6 +317,53 @@ async def test_a_missing_refresh_token_names_the_scope_the_operator_has_to_set(c
     assert transport.calls == []
     assert "GENERIC_SCOPE" in caplog.text
     assert "offline_access" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_expired_saml_assertion_is_never_redeemed_and_names_the_re_login(caplog: pytest.LogCaptureFixture):
+    """SAML has no refresh grant. Even a row that somehow carries a refresh token must not be posted
+    to the generic OIDC client, and the operator hint about GENERIC_SCOPE does not apply."""
+    saml = assertion_from_saml_login(b"<saml:Assertion/>", int(time.time()) - 1, "https://idp.example.com")
+    with_refresh_token = saml.model_copy(update={"refresh_token": SecretStr("rt_saml")})
+    rows = _FakeRows({"alice": with_refresh_token})
+    transport = _FakeTransport(_renewal(_id_token()))
+
+    served = await _store(rows, transport).fetch("alice")
+    refresher = SSOAssertionRefresher(transport, client_config=lambda: _CLIENT, read=rows.fetch, write=rows.write)
+    with caplog.at_level(logging.WARNING):
+        outcome = await refresher.refresh("alice", with_refresh_token)
+
+    assert served == with_refresh_token
+    assert transport.calls == []
+    assert rows.writes == []
+    match outcome:
+        case Error(failure):
+            assert failure.kind == "rejected"
+            assert "sign in" in failure.detail
+        case Ok(_):
+            pytest.fail("a SAML assertion must not be renewable")
+    assert "sign in" in caplog.text
+    assert "GENERIC_SCOPE" not in caplog.text
+
+
+class _ForbiddenCoordinator:
+    async def run(self, user_id: str, key: str, *, refresh: object, reread: object) -> None:
+        raise AssertionError(f"a SAML assertion must never enter the refresh path (user_id={user_id}, key={key})")
+
+
+@pytest.mark.asyncio
+async def test_a_saml_assertion_inside_the_expiry_skew_is_served_as_is_without_electing_a_renewal():
+    """SAML cannot be renewed, so a still-valid assertion near its NotOnOrAfter is handed out untouched
+    instead of running the single-flight election that would 503 the losers."""
+    saml = assertion_from_saml_login(b"<saml:Assertion/>", int(time.time()) + 30, "https://idp.example.com")
+    rows = _FakeRows({"alice": saml})
+    transport = _FakeTransport(_renewal(_id_token()))
+
+    served = await _store(rows, transport, coordinator_factory=_ForbiddenCoordinator).fetch("alice")
+
+    assert served == saml
+    assert transport.calls == []
+    assert rows.writes == []
 
 
 @pytest.mark.asyncio
